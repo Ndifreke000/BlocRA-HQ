@@ -1,5 +1,49 @@
 const express = require('express');
 const router = express.Router();
+const ContractQuery = require('../models/ContractQuery');
+const authMiddleware = require('../middlewares/authMiddlewares');
+
+const RPC_ENDPOINTS = [
+  'https://rpc.starknet.lava.build',
+  'https://starknet-mainnet.g.alchemy.com/v2/demo',
+  'https://starknet-mainnet.public.blastapi.io',
+  'https://free-rpc.nethermind.io/mainnet-juno'
+];
+
+let currentRpcIndex = 0;
+const getRpcUrl = () => RPC_ENDPOINTS[currentRpcIndex];
+const switchRpc = () => { currentRpcIndex = (currentRpcIndex + 1) % RPC_ENDPOINTS.length; };
+
+async function rpcCall(method, params) {
+  for (let i = 0; i < RPC_ENDPOINTS.length; i++) {
+    try {
+      const res = await fetch(getRpcUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method, params, id: 1 })
+      });
+      const data = await res.json();
+      if (data.result) return data.result;
+    } catch (e) {
+      switchRpc();
+    }
+  }
+  throw new Error('All RPC endpoints failed');
+}
+
+async function findBlockByTimestamp(targetTs) {
+  const latest = await rpcCall('starknet_blockNumber', []);
+  let low = 0, high = latest;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const block = await rpcCall('starknet_getBlockWithTxs', [{ block_number: mid }]);
+    if (!block?.timestamp) break;
+    if (block.timestamp < targetTs) low = mid + 1;
+    else if (block.timestamp > targetTs) high = mid - 1;
+    else return mid;
+  }
+  return low;
+}
 
 // Helper: Binary search to find block number from timestamp
 async function findBlockByTimestamp(targetTimestamp, endpoint) {
@@ -29,6 +73,85 @@ async function findBlockByTimestamp(targetTimestamp, endpoint) {
   return low;
 }
 
+// Fetch contract events with date range
+router.post('/events', async (req, res) => {
+  try {
+    const { contractAddress, fromDate, toDate, chain } = req.body;
+
+    if (!contractAddress) {
+      return res.status(400).json({ success: false, message: 'Contract address required' });
+    }
+
+    const fromTs = fromDate ? Math.floor(new Date(fromDate).getTime() / 1000) : null;
+    const toTs = toDate ? Math.floor(new Date(toDate).getTime() / 1000) : null;
+
+    const latest = await rpcCall('starknet_blockNumber', []);
+    const fromBlock = fromTs ? await findBlockByTimestamp(fromTs) : Math.max(0, latest - 2000);
+    const toBlock = toTs ? await findBlockByTimestamp(toTs) : latest;
+
+    const { RpcProvider } = require('starknet');
+    const provider = new RpcProvider({ nodeUrl: getRpcUrl() });
+
+    const events = await provider.getEvents({
+      address: contractAddress,
+      from_block: { block_number: fromBlock },
+      to_block: { block_number: toBlock },
+      chunk_size: 1000
+    });
+
+    const latestBlock = await rpcCall('starknet_getBlockWithTxs', [{ block_number: latest }]);
+    const latestTimestamp = latestBlock?.timestamp || Math.floor(Date.now() / 1000);
+    const fromBlockData = await rpcCall('starknet_getBlockWithTxs', [{ block_number: fromBlock }]);
+    const fromTimestamp = fromBlockData?.timestamp || (latestTimestamp - 2000 * 15);
+
+    const decodedEvents = (events.events || []).map(event => {
+      let eventName = 'Unknown Event';
+      let decodedData = {};
+
+      const blockDiff = latest - event.block_number;
+      const totalDiff = latest - fromBlock;
+      const timeDiff = latestTimestamp - fromTimestamp;
+      const estimatedTimestamp = latestTimestamp - (blockDiff / totalDiff) * timeDiff;
+
+      if (event.keys?.[0]) {
+        const key = event.keys[0];
+        if (key === '0x99cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9') {
+          eventName = 'Transfer';
+          if (event.data?.length >= 3) {
+            decodedData = { from: event.data[0], to: event.data[1], amount: parseInt(event.data[2], 16).toString() };
+          }
+        } else if (key === '0x1dcde06aabdbca2f80aa51392b345d7549d7757aa855f7e37f5d335ac8243b1') {
+          eventName = 'Approval';
+          if (event.data?.length >= 3) {
+            decodedData = { owner: event.data[0], spender: event.data[1], amount: parseInt(event.data[2], 16).toString() };
+          }
+        }
+      }
+
+      return {
+        ...event,
+        event_name: eventName,
+        decoded_data: decodedData,
+        timestamp: new Date(estimatedTimestamp * 1000).toISOString(),
+        timestamp_raw: estimatedTimestamp
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        events: decodedEvents,
+        fromBlock,
+        toBlock,
+        totalEvents: decodedEvents.length
+      }
+    });
+  } catch (error) {
+    console.error('Events fetch error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Analyze contract endpoint
 router.post('/analyze', async (req, res) => {
   try {
@@ -43,40 +166,13 @@ router.post('/analyze', async (req, res) => {
 
     console.log(`🔍 Analyzing contract: ${contractAddress}`);
 
-    // Starknet RPC endpoints
-    const endpoints = [
-      "https://starknet-mainnet.public.blastapi.io",
-      "https://free-rpc.nethermind.io/mainnet-juno"
-    ];
-
-    // Get current block number
-    const blockResponse = await fetch(endpoints[0], {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'starknet_blockNumber',
-        params: [],
-        id: 1
-      })
-    });
-
-    const blockData = await blockResponse.json();
-    const currentBlock = parseInt(blockData.result, 16);
+    const currentBlock = await rpcCall('starknet_blockNumber', []);
     console.log(`📦 Current block: ${currentBlock}`);
 
-    // Determine block range
-    let fromBlock, toBlock;
-    if (fromDate && toDate) {
-      const fromTimestamp = Math.floor(new Date(fromDate).getTime() / 1000);
-      const toTimestamp = Math.floor(new Date(toDate).getTime() / 1000);
-      fromBlock = await findBlockByTimestamp(fromTimestamp, endpoints[0]);
-      toBlock = await findBlockByTimestamp(toTimestamp, endpoints[0]);
-      console.log(`📅 Date range: ${fromDate} to ${toDate} → blocks ${fromBlock} to ${toBlock}`);
-    } else {
-      fromBlock = Math.max(0, currentBlock - 1000);
-      toBlock = currentBlock;
-    }
+    const fromTs = fromDate ? Math.floor(new Date(fromDate).getTime() / 1000) : null;
+    const toTs = toDate ? Math.floor(new Date(toDate).getTime() / 1000) : null;
+    const fromBlock = fromTs ? await findBlockByTimestamp(fromTs) : Math.max(0, currentBlock - 1000);
+    const toBlock = toTs ? await findBlockByTimestamp(toTs) : currentBlock;
 
     const contractTransactions = [];
     const searchBlocks = Math.min(toBlock - fromBlock + 1, 20000); // Cap at 20k blocks
@@ -86,19 +182,7 @@ router.post('/analyze', async (req, res) => {
       if (blockNum < fromBlock) break;
       
       try {
-        const response = await fetch(endpoints[0], {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'starknet_getBlockWithTxs',
-            params: [{ block_number: blockNum }],
-            id: i + 2
-          })
-        });
-
-        const data = await response.json();
-        const block = data.result;
+        const block = await rpcCall('starknet_getBlockWithTxs', [{ block_number: blockNum }]);
 
         if (block && block.transactions) {
           // Filter transactions involving this contract
@@ -129,20 +213,8 @@ router.post('/analyze', async (req, res) => {
       // Try to get contract class info
       let contractInfo = 'Unknown Contract';
       try {
-        const classResponse = await fetch(endpoints[0], {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'starknet_getClassAt',
-            params: [contractAddress, 'latest'],
-            id: 999
-          })
-        });
-        const classData = await classResponse.json();
-        if (classData.result && !classData.error) {
-          contractInfo = 'Valid Contract (Deployed)';
-        }
+        const classData = await rpcCall('starknet_getClassAt', [contractAddress, 'latest']);
+        if (classData) contractInfo = 'Valid Contract (Deployed)';
       } catch (e) {
         contractInfo = 'Contract Not Found or Invalid';
       }
@@ -194,6 +266,53 @@ router.post('/analyze', async (req, res) => {
       message: 'Failed to analyze contract',
       error: error.message
     });
+  }
+});
+
+// Save contract query
+router.post('/save-query', authMiddleware.authenticate, async (req, res) => {
+  try {
+    const { contracts, chain, fromDate, toDate, events, stats, contractInfo } = req.body;
+    const query = new ContractQuery({
+      contracts,
+      chain,
+      fromDate,
+      toDate,
+      events,
+      stats,
+      contractInfo,
+      createdBy: req.user.userId
+    });
+    await query.save();
+    res.json({ success: true, data: { queryId: query._id } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get saved queries
+router.get('/saved-queries', authMiddleware.authenticate, async (req, res) => {
+  try {
+    const queries = await ContractQuery.find({ createdBy: req.user.userId })
+      .select('-events')
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json({ success: true, data: { queries } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get query by ID
+router.get('/query/:id', authMiddleware.authenticate, async (req, res) => {
+  try {
+    const query = await ContractQuery.findById(req.params.id);
+    if (!query || query.createdBy.toString() !== req.user.userId) {
+      return res.status(404).json({ success: false, message: 'Query not found' });
+    }
+    res.json({ success: true, data: { query } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
